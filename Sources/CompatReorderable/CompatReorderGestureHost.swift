@@ -19,6 +19,7 @@
 #if os(iOS) || os(visionOS)
 
 import ObjectiveC
+import QuartzCore
 import SwiftUI
 import UIKit
 
@@ -64,6 +65,8 @@ struct CompatReorderGestureHost: UIViewRepresentable {
         /// layout: that waits for the session to reach this container's
         /// drop interaction (`beginPendingDrag(for:)`).
         private var pendingToken: CompatReorderDragToken?
+        // Metal content is captured before the source cell becomes transparent.
+        private var liftedPreviewImage: (token: CompatReorderDragToken, image: UIImage)?
 
         /// Snapshots are drawn from and drop targets anchor to this view:
         /// the scroll view when there is one, else the interaction host.
@@ -122,6 +125,7 @@ struct CompatReorderGestureHost: UIViewRepresentable {
         func detach() {
             stopDisplayLink()
             pendingToken = nil
+            liftedPreviewImage = nil
             interactionGroup?.unregister(self)
             interactionGroup = nil
             interactionHostView = nil
@@ -241,6 +245,7 @@ struct CompatReorderGestureHost: UIViewRepresentable {
             }
 
             func dragInteraction(_ interaction: UIDragInteraction, session: UIDragSession, didEndWith operation: UIDropOperation) {
+                session.items.first.flatMap(owner(of:))?.liftedPreviewImage = nil
                 activeHost = nil
             }
 
@@ -450,7 +455,8 @@ struct CompatReorderGestureHost: UIViewRepresentable {
             // card lowering into place. The cell underneath stays hidden
             // until the animation completes; since the landed copy matches
             // the cell pixel-for-pixel, the final swap is invisible — one
-            // item visible at all times.
+            // item visible at all times. Metal-backed cells reuse their lift
+            // snapshot because the on-screen source is now transparent.
             if let landed = renderedPreview(
                 for: token,
                 frameInContainer: frameInContainer,
@@ -462,14 +468,9 @@ struct CompatReorderGestureHost: UIViewRepresentable {
             return defaultPreview.retargetedPreview(with: target)
         }
 
-        /// The cell's SwiftUI content rendered synchronously to an image via
-        /// ImageRenderer — no window dependence, so it works on the
-        /// menu-linked drag path too (UIKit snapshots that preview before
-        /// any window exists; hosted views come out empty there). No
-        /// visiblePath or system shadow plate (those are rectangular and
-        /// mismatch rounded cells); the hover elevation is a SwiftUI shadow
-        /// hugging the cell's actual rendered shape, with transparent
-        /// padding so it isn't clipped at the canvas bounds.
+        /// Render pure SwiftUI content directly. Metal-backed cells use a
+        /// snapshot of their visible hierarchy instead; ImageRenderer supplies
+        /// only their alpha mask because it cannot capture those surfaces.
         private func renderedPreview(
             for token: CompatReorderDragToken,
             frameInContainer: CGRect,
@@ -483,21 +484,53 @@ struct CompatReorderGestureHost: UIViewRepresentable {
                   let content = reorderCoordinator.previewContent(for: token)
             else { return nil }
 
-            let renderer = ImageRenderer(
-                content: content
-                    .frame(
-                        width: frameInContainer.width,
-                        height: frameInContainer.height
+            if includeHoverShadow { liftedPreviewImage = nil }
+            let image: UIImage
+            if !includeHoverShadow, let liftedPreviewImage, liftedPreviewImage.token === token {
+                image = liftedPreviewImage.image
+            } else {
+                let renderer = ImageRenderer(
+                    content: content
+                        .frame(
+                            width: frameInContainer.width,
+                            height: frameInContainer.height
+                        )
+                        .environment(
+                            \.colorScheme,
+                            traitCollection.userInterfaceStyle == .dark ? .dark : .light
+                        )
+                )
+                renderer.proposedSize = ProposedViewSize(frameInContainer.size)
+                // The view's own scale: visionOS has no screen to ask.
+                renderer.scale = traitCollection.displayScale
+                guard let renderedImage = renderer.uiImage else { return nil }
+                if includeHoverShadow,
+                   let metalView = metalContentView(
+                       in: container,
+                       intersecting: frameInContainer,
+                       relativeTo: container
+                   ) {
+                    // Capture the scroll content subtree without its viewport
+                    // clipping, so a partly visible cell stays whole.
+                    var snapshotRoot = container
+                    if container is UIScrollView {
+                        snapshotRoot = metalView
+                        while let parent = snapshotRoot.superview, parent !== container {
+                            snapshotRoot = parent
+                        }
+                    }
+                    // ImageRenderer substitutes a placeholder for Metal-backed
+                    // views. Retain only its alpha mask for the exact cell shape.
+                    image = hierarchyImage(
+                        in: snapshotRoot,
+                        frame: container.convert(frameInContainer, to: snapshotRoot),
+                        maskedBy: renderedImage
                     )
-                    .environment(
-                        \.colorScheme,
-                        traitCollection.userInterfaceStyle == .dark ? .dark : .light
-                    )
-            )
-            renderer.proposedSize = ProposedViewSize(frameInContainer.size)
-            // The view's own scale: visionOS has no screen to ask.
-            renderer.scale = traitCollection.displayScale
-            guard let image = renderer.uiImage else { return nil }
+                    liftedPreviewImage = (token, image)
+                } else {
+                    image = renderedImage
+                }
+            }
 
             let imageView = UIImageView(image: image)
             imageView.frame = CGRect(origin: .zero, size: frameInContainer.size)
@@ -543,6 +576,49 @@ struct CompatReorderGestureHost: UIViewRepresentable {
                 center: CGPoint(x: frameInContainer.midX, y: frameInContainer.midY)
             )
             return UITargetedDragPreview(view: imageView, parameters: parameters, target: target)
+        }
+
+        private func metalContentView(
+            in view: UIView,
+            intersecting frame: CGRect,
+            relativeTo container: UIView
+        ) -> UIView? {
+            guard !view.isHidden, view.alpha > 0,
+                  view.convert(view.bounds, to: container).intersects(frame)
+            else { return nil }
+            if view.layer is CAMetalLayer { return view }
+            for child in view.subviews {
+                if let match = metalContentView(in: child, intersecting: frame, relativeTo: container) {
+                    return match
+                }
+            }
+            return nil
+        }
+
+        private func hierarchyImage(
+            in container: UIView,
+            frame: CGRect,
+            maskedBy mask: UIImage
+        ) -> UIImage {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = traitCollection.displayScale
+            let renderer = UIGraphicsImageRenderer(size: frame.size, format: format)
+            let snapshot = renderer.image { _ in
+                let origin = CGPoint(
+                    x: container.bounds.minX - frame.minX,
+                    y: container.bounds.minY - frame.minY
+                )
+                container.drawHierarchy(
+                    in: CGRect(origin: origin, size: container.bounds.size),
+                    afterScreenUpdates: false
+                )
+            }
+            return renderer.image { _ in
+                let rect = CGRect(origin: .zero, size: frame.size)
+                snapshot.draw(in: rect)
+                // The surrounding content must not fill transparent corners.
+                mask.draw(in: rect, blendMode: .destinationIn, alpha: 1)
+            }
         }
 
         func dropInteraction(
