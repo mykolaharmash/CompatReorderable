@@ -263,6 +263,29 @@ struct CoordinatorTests {
         #expect(coordinator.displayIDs == nil)
     }
 
+    @Test func replacedItemsCannotBeLiftedFromStaleFrames() {
+        let coordinator = makeSingleColumnCoordinator()
+        // The number of items stays the same, as when demo data is regenerated.
+        coordinator.sourceIDs = ["replacement", "b", "c", "d"]
+        let point = CGPoint(x: 50, y: 50)
+        #expect(coordinator.itemID(at: point) == nil)
+        #expect(coordinator.dragToken(at: point) == nil)
+
+        coordinator.frames["replacement"] = CGRect(x: 0, y: 0, width: 100, height: 100)
+        #expect(coordinator.itemID(at: point) == "replacement")
+        #expect(coordinator.dragToken(at: point)?.itemID == AnyHashable("replacement"))
+    }
+
+    @Test func removedRowsCannotRegisterLateFrames() {
+        let coordinator = makeSingleColumnCoordinator()
+        coordinator.sourceIDs = ["replacement", "b", "c", "d"]
+        coordinator.recordFrame(CGRect(x: 0, y: 0, width: 100, height: 100), for: "a")
+        #expect(coordinator.frames["a"] == nil)
+        #expect(coordinator.dragToken(at: CGPoint(x: 50, y: 50)) == nil)
+        coordinator.beginDrag(id: "a")
+        #expect(!coordinator.hasActiveDrag)
+    }
+
     @Test func itemLookupByPoint() {
         let coordinator = makeSingleColumnCoordinator()
         #expect(coordinator.itemID(at: CGPoint(x: 50, y: 250)) == "c")

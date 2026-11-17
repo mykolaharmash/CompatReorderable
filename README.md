@@ -135,11 +135,11 @@ ScrollView { ... }
 - Single collection per container — the native `collectionID:`/sections overloads have no compat counterpart.
 - Items cannot be dragged out to other apps; reorder sessions are app-restricted by design.
 - Drag previews are rendered images of the cell content; cells that animate will show a static image while dragged. On release, the drop animation lands a freshly rendered copy with the *committed* content (index badges, timestamps), and the final swap with the live cell is pixel-identical. Cells using blur materials may render slightly differently in previews (ImageRenderer limitation).
-- One reorder container per scroll view: two compat containers sharing the same scroll view is unsupported (their interactions would land on the same hosting view).
+- One reorder container per scroll view. Separate scroll panes can share the same hosting view; they share one interaction pair that routes each drag to its owning container.
 
 ## How it works
 
-A `UIDragInteraction` and `UIDropInteraction` are installed on the same hosting view that carries SwiftUI's context-menu interaction (that shared view is what makes UIKit link menu and drag). Dragged items carry an empty `NSItemProvider` with a local object — mirroring the native implementation's empty transfer representation. Cell frames are tracked in a container coordinate space via `onGeometryChange`; the drop session location drives a retargeting pass that reorders only a *display* order, never your data. On drop, the difference is reported once and the system's drop animation lands the preview on the item's slot.
+One `UIDragInteraction` and `UIDropInteraction` pair is installed on each hosting view that carries SwiftUI's context-menu interaction (that shared view is what makes UIKit link menu and drag). When multiple reorder containers share a hosting view, the pair selects the source container by hit testing and routes the session using its local ownership token. Dragged items carry an empty `NSItemProvider` with a local object — mirroring the native implementation's empty transfer representation. Cell frames are tracked in a container coordinate space via `onGeometryChange`; the drop session location drives a retargeting pass that reorders only a *display* order, never your data. On drop, the difference is reported once and the system's drop animation lands the preview on the item's slot.
 
 ## License
 

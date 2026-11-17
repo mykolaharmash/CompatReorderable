@@ -215,7 +215,7 @@ struct CompatReorderableForEach<Data: RandomAccessCollection, Content: View>: Vi
         ForEach(displayData(coordinator)) { element in
             cell(for: element, coordinator: coordinator)
                 .reportsFrame { frame in
-                    coordinator?.frames[element.id] = frame
+                    coordinator?.recordFrame(frame, for: element.id)
                 }
         }
     }
@@ -257,13 +257,6 @@ struct CompatReorderableForEach<Data: RandomAccessCollection, Content: View>: Vi
         let ids = data.map(\.id)
         if coordinator.sourceIDs != ids {
             coordinator.sourceIDs = ids
-            // Prune frames of deleted items: ghost frames would otherwise
-            // cover regions the survivors reflowed into, intermittently
-            // hijacking retargets and lifting nonexistent items.
-            let valid = Set(ids)
-            if coordinator.frames.count != valid.count {
-                coordinator.frames = coordinator.frames.filter { valid.contains($0.key) }
-            }
         }
 
         // Used by the fallback backends for the dragged overlay, and by the

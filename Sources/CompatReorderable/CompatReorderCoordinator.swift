@@ -87,8 +87,17 @@ final class CompatReorderCoordinator<ItemID: Hashable>: ObservableObject, Compat
 
     // MARK: Unobserved bookkeeping
 
-    var sourceIDs: [ItemID] = []
+    var sourceIDs: [ItemID] = [] {
+        didSet {
+            guard sourceIDs != oldValue else { return }
+            sourceIDSet = Set(sourceIDs)
+            // Replacing an item can preserve the count. Its old frame must
+            // still disappear before the replacement reports its geometry.
+            frames = frames.filter { sourceIDSet.contains($0.key) }
+        }
+    }
     var frames: [ItemID: CGRect] = [:]
+    private var sourceIDSet: Set<ItemID> = []
     var commitMove: ((_ sources: [ItemID], _ before: ItemID?) -> Void)?
     var isReorderEnabled = true
     var animations = CompatReorderAnimations()
@@ -98,12 +107,18 @@ final class CompatReorderCoordinator<ItemID: Hashable>: ObservableObject, Compat
 
     // MARK: Drag lifecycle
 
+    func recordFrame(_ frame: CGRect, for id: ItemID) {
+        // A removed SwiftUI row can deliver a final geometry callback.
+        guard sourceIDSet.contains(id) else { return }
+        frames[id] = frame
+    }
+
     func itemID(at point: CGPoint) -> ItemID? {
-        frames.first { $0.value.contains(point) }?.key
+        frames.first { sourceIDSet.contains($0.key) && $0.value.contains(point) }?.key
     }
 
     func beginDrag(id: ItemID) {
-        guard draggedID == nil else { return }
+        guard draggedID == nil, sourceIDSet.contains(id) else { return }
         displayIDs = sourceIDs
         draggedID = id
     }

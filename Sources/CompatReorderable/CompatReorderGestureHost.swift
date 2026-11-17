@@ -4,12 +4,12 @@
 //
 //  UIKit layer of the compat reorder API, built on the system drag-and-drop
 //  interactions — the same machinery the native iOS 27 `reorderable()` uses
-//  internally. A `UIDragInteraction` is installed on the same hosting view
+//  internally. A shared `UIDragInteraction` is installed on each hosting view
 //  that carries SwiftUI's `UIContextMenuInteraction`, so UIKit links the two
 //  the way Apple's own apps do: holding still presents the menu, dragging
 //  (including dragging out of a presented menu) dismisses it and starts the
-//  reorder. A `UIDropInteraction` on the same view feeds the session
-//  location to the coordinator, which moves the gap and commits on drop.
+//  reorder. A `UIDropInteraction` on the same view routes the session to its
+//  owning container, whose coordinator moves the gap and commits on drop.
 //
 //  iOS/iPadOS/Catalyst/visionOS only — watchOS and macOS have no drag
 //  interactions and use the SwiftUI gesture backend in
@@ -18,6 +18,7 @@
 
 #if os(iOS) || os(visionOS)
 
+import ObjectiveC
 import SwiftUI
 import UIKit
 
@@ -46,13 +47,13 @@ struct CompatReorderGestureHost: UIViewRepresentable {
         var reorderCoordinator: (any CompatReorderDragDriving)?
 
         var isReorderEnabled = true {
-            didSet { dragInteraction?.isEnabled = isReorderEnabled }
+            didSet { interactionGroup?.refreshEnabled() }
         }
 
         private weak var scrollView: UIScrollView?
         private weak var interactionHostView: UIView?
-        private var dragInteraction: UIDragInteraction?
-        private var dropInteraction: UIDropInteraction?
+        private static var interactionGroupKey: UInt8 = 0
+        private var interactionGroup: InteractionGroup?
         private weak var activeDropSession: UIDropSession?
         private var displayLink: CADisplayLink?
         private var lastTickTimestamp: CFTimeInterval = 0
@@ -70,7 +71,11 @@ struct CompatReorderGestureHost: UIViewRepresentable {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            guard window != nil, dragInteraction == nil else { return }
+            guard window != nil else {
+                detach()
+                return
+            }
+            guard interactionGroup == nil else { return }
 
             // The enclosing scroll view powers auto-scroll, but is optional:
             // plain, non-scrolling containers reorder fine without one.
@@ -102,30 +107,170 @@ struct CompatReorderGestureHost: UIViewRepresentable {
             }
             let target = menuHost ?? hostingFallback ?? scrollView ?? topmost
 
-            let drag = UIDragInteraction(delegate: self)
-            drag.isEnabled = isReorderEnabled
-            let drop = UIDropInteraction(delegate: self)
-            target.addInteraction(drag)
-            target.addInteraction(drop)
+            let group: InteractionGroup
+            if let existing = objc_getAssociatedObject(target, &HostView.interactionGroupKey) as? InteractionGroup {
+                group = existing
+            } else {
+                group = InteractionGroup(view: target)
+                objc_setAssociatedObject(target, &HostView.interactionGroupKey, group, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+            }
             interactionHostView = target
-            dragInteraction = drag
-            dropInteraction = drop
+            interactionGroup = group
+            group.register(self)
         }
 
         func detach() {
             stopDisplayLink()
-            if let dragInteraction {
-                interactionHostView?.removeInteraction(dragInteraction)
+            pendingToken = nil
+            interactionGroup?.unregister(self)
+            interactionGroup = nil
+            interactionHostView = nil
+            scrollView = nil
+            if let coordinator = reorderCoordinator, coordinator.hasActiveDrag {
+                // Detaching can run during a SwiftUI update. Release a cancelled
+                // session on the next turn so a retained container can drag again.
+                DispatchQueue.main.async {
+                    coordinator.revertDrag()
+                    coordinator.finishDrag()
+                }
             }
-            if let dropInteraction {
-                interactionHostView?.removeInteraction(dropInteraction)
-            }
-            dragInteraction = nil
-            dropInteraction = nil
         }
 
         private func reorderToken(of item: UIDragItem) -> CompatReorderDragToken? {
             item.localObject as? CompatReorderDragToken
+        }
+
+        /// SwiftUI can place separate scroll panes on one hosting view. A
+        /// single interaction pair avoids competing lift recognizers there.
+        private final class InteractionGroup: NSObject, UIDragInteractionDelegate, UIDropInteractionDelegate {
+            private final class WeakHost {
+                weak var value: HostView?
+                init(_ value: HostView) { self.value = value }
+            }
+
+            private weak var view: UIView?
+            private var hosts: [WeakHost] = []
+            private weak var activeHost: HostView?
+            private var drag: UIDragInteraction!
+            private var drop: UIDropInteraction!
+
+            init(view: UIView) {
+                self.view = view
+                super.init()
+                drag = UIDragInteraction(delegate: self)
+                drop = UIDropInteraction(delegate: self)
+                view.addInteraction(drag)
+                view.addInteraction(drop)
+            }
+
+            func register(_ host: HostView) {
+                hosts.removeAll { $0.value == nil || $0.value === host }
+                hosts.append(WeakHost(host))
+                refreshEnabled()
+            }
+
+            func unregister(_ host: HostView) {
+                hosts.removeAll { $0.value == nil || $0.value === host }
+                refreshEnabled()
+                if hosts.isEmpty, let view {
+                    view.removeInteraction(drag)
+                    view.removeInteraction(drop)
+                    objc_setAssociatedObject(view, &HostView.interactionGroupKey, nil, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+                }
+            }
+
+            func refreshEnabled() {
+                let enabled = hosts.contains { $0.value?.isReorderEnabled == true }
+                if drag.isEnabled != enabled { drag.isEnabled = enabled }
+            }
+
+            private func owner(of item: UIDragItem) -> HostView? {
+                guard let token = item.localObject as? CompatReorderDragToken else { return nil }
+                if let activeHost, activeHost.reorderCoordinator?.owns(token) == true { return activeHost }
+                return hosts.compactMap(\.value).first { $0.reorderCoordinator?.owns(token) == true }
+            }
+
+            private func owner(of session: UIDropSession) -> HostView? {
+                session.localDragSession?.items.first.flatMap(owner(of:))
+            }
+
+            func dragInteraction(_ interaction: UIDragInteraction, itemsForBeginning session: UIDragSession) -> [UIDragItem] {
+                let candidates = hosts.compactMap(\.value).filter { host in
+                    guard host.isReorderEnabled, host.window != nil,
+                          host.bounds.contains(session.location(in: host)) else { return false }
+                    var ancestor: UIView? = host
+                    while let view = ancestor {
+                        if view.isHidden || view.alpha <= 0.01 { return false }
+                        ancestor = view.superview
+                    }
+                    return true
+                }
+                let hitView = view.flatMap { $0.hitTest(session.location(in: $0), with: nil) }
+                let direct = candidates.filter { host in
+                    guard let scrollView = host.scrollView, let hitView else { return false }
+                    return hitView === scrollView || hitView.isDescendant(of: scrollView)
+                }
+                for host in (direct.isEmpty ? candidates : direct).reversed() {
+                    let items = host.dragInteraction(interaction, itemsForBeginning: session)
+                    if !items.isEmpty {
+                        activeHost = host
+                        return items
+                    }
+                }
+                return []
+            }
+
+            func dragInteraction(_ interaction: UIDragInteraction, sessionIsRestrictedToDraggingApplication session: UIDragSession) -> Bool { true }
+            func dragInteraction(_ interaction: UIDragInteraction, sessionAllowsMoveOperation session: UIDragSession) -> Bool { true }
+            func dragInteraction(_ interaction: UIDragInteraction, prefersFullSizePreviewsFor session: UIDragSession) -> Bool { false }
+
+            func dragInteraction(_ interaction: UIDragInteraction, previewForLifting item: UIDragItem, session: UIDragSession) -> UITargetedDragPreview? {
+                owner(of: item)?.dragInteraction(interaction, previewForLifting: item, session: session)
+            }
+
+            func dragInteraction(_ interaction: UIDragInteraction, sessionWillBegin session: UIDragSession) {
+                session.items.first.flatMap(owner(of:))?.dragInteraction(interaction, sessionWillBegin: session)
+            }
+
+            func dragInteraction(_ interaction: UIDragInteraction, session: UIDragSession, willEndWith operation: UIDropOperation) {
+                session.items.first.flatMap(owner(of:))?.dragInteraction(interaction, session: session, willEndWith: operation)
+            }
+
+            func dragInteraction(_ interaction: UIDragInteraction, item: UIDragItem, willAnimateCancelWith animator: UIDragAnimating) {
+                owner(of: item)?.dragInteraction(interaction, item: item, willAnimateCancelWith: animator)
+            }
+
+            func dragInteraction(_ interaction: UIDragInteraction, session: UIDragSession, didEndWith operation: UIDropOperation) {
+                activeHost = nil
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+                owner(of: session)?.dropInteraction(interaction, canHandle: session) ?? false
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnter session: UIDropSession) {
+                owner(of: session)?.dropInteraction(interaction, sessionDidEnter: session)
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+                owner(of: session)?.dropInteraction(interaction, sessionDidUpdate: session) ?? UIDropProposal(operation: .cancel)
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+                owner(of: session)?.dropInteraction(interaction, performDrop: session)
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, previewForDropping item: UIDragItem, withDefault defaultPreview: UITargetedDragPreview) -> UITargetedDragPreview? {
+                owner(of: item)?.dropInteraction(interaction, previewForDropping: item, withDefault: defaultPreview)
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, item: UIDragItem, willAnimateDropWith animator: UIDragAnimating) {
+                owner(of: item)?.dropInteraction(interaction, item: item, willAnimateDropWith: animator)
+            }
+
+            func dropInteraction(_ interaction: UIDropInteraction, sessionDidEnd session: UIDropSession) {
+                owner(of: session)?.dropInteraction(interaction, sessionDidEnd: session)
+            }
         }
 
         // MARK: - UIDragInteractionDelegate
@@ -134,9 +279,10 @@ struct CompatReorderGestureHost: UIViewRepresentable {
             _ interaction: UIDragInteraction,
             itemsForBeginning session: UIDragSession
         ) -> [UIDragItem] {
-            guard let reorderCoordinator,
-                  !reorderCoordinator.hasActiveDrag,
-                  let token = reorderCoordinator.dragToken(at: session.location(in: self))
+            guard let reorderCoordinator else { return [] }
+            let point = session.location(in: self)
+            guard !reorderCoordinator.hasActiveDrag,
+                  let token = reorderCoordinator.dragToken(at: point)
             else { return [] }
 
             // An empty provider with a local token — the reorder never
@@ -146,30 +292,6 @@ struct CompatReorderGestureHost: UIViewRepresentable {
             let item = UIDragItem(itemProvider: NSItemProvider())
             item.localObject = token
             return [item]
-        }
-
-        func dragInteraction(
-            _ interaction: UIDragInteraction,
-            sessionIsRestrictedToDraggingApplication session: UIDragSession
-        ) -> Bool {
-            true
-        }
-
-        func dragInteraction(
-            _ interaction: UIDragInteraction,
-            sessionAllowsMoveOperation session: UIDragSession
-        ) -> Bool {
-            true
-        }
-
-        func dragInteraction(
-            _ interaction: UIDragInteraction,
-            prefersFullSizePreviewsFor session: UIDragSession
-        ) -> Bool {
-            // Native reorder feel: lift scales up in place, then the item
-            // shrinks to the system's carrying size while dragging, and
-            // grows back into the slot on drop.
-            false
         }
 
         func dragInteraction(
